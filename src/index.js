@@ -15,16 +15,32 @@ export default {
         roomKeyConfigured: Boolean(env.ROOM_KEY),
         durableObjectConfigured: Boolean(env.CHAT_ROOM),
         websocketEndpoint: "/ws",
+        mediaBucketConfigured: Boolean(env.MEDIA_BUCKET),
+        mediaStorage: "R2 (optional binding MEDIA_BUCKET)",
         messageHistoryStored: false
       });
     }
 
-    if (url.pathname !== "/ws") {
-      return new Response("SACRIFICE relay. WebSocket endpoint: /ws", { status: 404 });
+    // Public media reads use opaque, random object keys. Uploads remain authenticated.
+    if (url.pathname.startsWith("/media/")) {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, HEAD" } });
+      }
+      if (!env.MEDIA_BUCKET) return Response.json({ error: "MEDIA_BUCKET_NOT_CONFIGURED" }, { status: 503 });
+      const objectKey = url.pathname.slice("/media/".length);
+      if (!objectKey.startsWith("uploads/") || objectKey.includes("..")) return new Response("Not found", { status: 404 });
+      const object = await env.MEDIA_BUCKET.get(objectKey);
+      if (!object) return new Response("Not found", { status: 404 });
+      const headers = new Headers();
+      object.writeHttpMetadata(headers);
+      headers.set("Cache-Control", "public, max-age=31536000, immutable");
+      headers.set("X-Content-Type-Options", "nosniff");
+      if (!headers.has("Content-Type")) headers.set("Content-Type", "application/octet-stream");
+      return new Response(request.method === "HEAD" ? null : object.body, { headers });
     }
 
-    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-      return new Response("WebSocket upgrade required", { status: 426 });
+    if (url.pathname !== "/ws" && !(url.pathname === "/media" && request.method === "POST")) {
+      return new Response("SACRIFICE relay. WebSocket endpoint: /ws", { status: 404 });
     }
 
     const headerKey = request.headers.get("X-SACRIFICE-KEY") || "";
@@ -48,6 +64,33 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
+    if (url.pathname === "/media" && request.method === "POST") {
+      if (!env.MEDIA_BUCKET) return Response.json({ error: "MEDIA_BUCKET_NOT_CONFIGURED", message: "Crie o bucket R2 sacrifice-media e configure o binding MEDIA_BUCKET." }, { status: 503 });
+      const contentType = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+      const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime"]);
+      if (!allowedTypes.has(contentType)) return Response.json({ error: "UNSUPPORTED_MEDIA_TYPE" }, { status: 415 });
+      const isVideo = contentType.startsWith("video/");
+      const maxBytes = isVideo ? 40 * 1024 * 1024 : 12 * 1024 * 1024;
+      const declaredSize = Number(request.headers.get("Content-Length") || 0);
+      if (declaredSize <= 0 || declaredSize > maxBytes) return Response.json({ error: "FILE_SIZE_LIMIT", maxBytes }, { status: 413 });
+      const bytes = await request.arrayBuffer();
+      if (bytes.byteLength <= 0 || bytes.byteLength > maxBytes) return Response.json({ error: "FILE_SIZE_LIMIT", maxBytes }, { status: 413 });
+      const extensions = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov" };
+      const objectKey = `uploads/${crypto.randomUUID()}.${extensions[contentType] || "bin"}`;
+      let decodedName = request.headers.get("X-Media-Name") || "arquivo";
+      try { decodedName = decodeURIComponent(decodedName); } catch { /* Keep the raw name if it is not valid URL encoding. */ }
+      const rawName = decodedName.replace(/[\r\n\0]/g, " ").trim().slice(0, 100) || "arquivo";
+      await env.MEDIA_BUCKET.put(objectKey, bytes, {
+        httpMetadata: { contentType, cacheControl: "public, max-age=31536000, immutable" },
+        customMetadata: { originalName: rawName, uploadedAt: new Date().toISOString() }
+      });
+      return Response.json({ url: `${url.origin}/media/${objectKey}`, mediaType: contentType, name: rawName, size: bytes.byteLength });
+    }
+
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("WebSocket upgrade required", { status: 426 });
+    }
+
     const id = env.CHAT_ROOM.idFromName("sacrifice-main-room-v1");
     return env.CHAT_ROOM.get(id).fetch(request);
   }
@@ -68,7 +111,7 @@ export class ChatRoom {
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({
-      id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", voice: "",
+      id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", presence: "online", voice: "",
       voiceMuted: false, serverMuted: false, deafened: false
     });
     return new Response(null, { status: 101, webSocket: client });
@@ -86,7 +129,7 @@ export class ChatRoom {
     if (!data || typeof data.type !== "string") return;
 
     const attachment = ws.deserializeAttachment() || {
-      id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", voice: "",
+      id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", presence: "online", voice: "",
       voiceMuted: false, serverMuted: false, deafened: false
     };
     const ownId = attachment.id;
@@ -103,6 +146,7 @@ export class ChatRoom {
       attachment.avatar = this.clean(data.avatar, 4);
       attachment.avatarUrl = this.clean(data.avatarUrl, 500);
       attachment.status = this.clean(data.status, 36);
+      attachment.presence = this.cleanPresence(data.presence);
       attachment.voice = "";
       attachment.voiceMuted = false;
       attachment.serverMuted = false;
@@ -127,6 +171,7 @@ export class ChatRoom {
       attachment.avatar = this.clean(data.avatar, 4);
       attachment.avatarUrl = this.clean(data.avatarUrl, 500);
       attachment.status = this.clean(data.status, 36);
+      attachment.presence = this.cleanPresence(data.presence || attachment.presence);
       ws.serializeAttachment(attachment);
       this.broadcast({ type: "presence_update", peers: this.peerSnapshot() });
       return;
@@ -150,7 +195,8 @@ export class ChatRoom {
 
     if (data.type === "chat") {
       const text = this.clean(data.text, 2000);
-      if (!text || !attachment.name) return;
+      const media = this.cleanMedia(data);
+      if ((!text && !media.url) || !attachment.name) return;
       this.broadcast({
         type: "chat",
         id: this.clean(data.id, 64) || crypto.randomUUID(),
@@ -162,6 +208,9 @@ export class ChatRoom {
         avatarUrl: attachment.avatarUrl || "",
         time: this.clean(data.time, 10) || new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" }),
         text,
+        mediaUrl: media.url,
+        mediaType: media.type,
+        mediaName: media.name,
         at: Number.isFinite(Number(data.at)) ? Number(data.at) : Date.now()
       });
       return;
@@ -170,7 +219,8 @@ export class ChatRoom {
     if (data.type === "dm") {
       const to = this.clean(data.to, 64);
       const text = this.clean(data.text, 2000);
-      if (!to || to === ownId || !text || !attachment.name) return;
+      const media = this.cleanMedia(data);
+      if (!to || to === ownId || (!text && !media.url) || !attachment.name) return;
       const recipient = this.findSocket(to);
       if (!recipient) {
         this.safeSend(ws, { type: "dm_error", to, message: "A pessoa está offline. A mensagem privada ficou salva apenas neste aparelho." });
@@ -187,6 +237,9 @@ export class ChatRoom {
         avatarUrl: attachment.avatarUrl || "",
         time: this.clean(data.time, 10) || new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" }),
         text,
+        mediaUrl: media.url,
+        mediaType: media.type,
+        mediaName: media.name,
         at: Number.isFinite(Number(data.at)) ? Number(data.at) : Date.now()
       };
       if (!this.safeSend(recipient, message)) {
@@ -209,7 +262,8 @@ export class ChatRoom {
         if (!item || typeof item !== "object") continue;
         if (this.clean(item.to || item.recipientId, 64)) continue;
         const text = this.clean(item.text, 2000);
-        if (!text) continue;
+        const media = this.cleanMedia(item);
+        if (!text && !media.url) continue;
         sanitized.push({
           id: this.clean(item.id, 64) || crypto.randomUUID(),
           time: this.clean(item.time, 10),
@@ -220,6 +274,9 @@ export class ChatRoom {
           from: this.clean(item.from, 64),
           to: "",
           text,
+          mediaUrl: media.url,
+          mediaType: media.type,
+          mediaName: media.name,
           at: Number.isFinite(Number(item.at)) ? Number(item.at) : Date.now()
         });
       }
@@ -393,6 +450,7 @@ export class ChatRoom {
           avatar: info.avatar || "",
           avatarUrl: info.avatarUrl || "",
           status: info.status || "",
+          presence: info.presence || "online",
           voice: info.voice || "",
           voiceMuted: Boolean(info.voiceMuted),
           serverMuted: Boolean(info.serverMuted),
@@ -426,6 +484,24 @@ export class ChatRoom {
 
   clean(value, maxLength) {
     return typeof value === "string" ? value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").trim().slice(0, maxLength) : "";
+  }
+
+  cleanPresence(value) {
+    const status = this.clean(value, 12).toLowerCase();
+    return ["online", "idle", "dnd"].includes(status) ? status : "online";
+  }
+
+  cleanMedia(item) {
+    const url = this.clean(item?.mediaUrl, 500);
+    const type = this.clean(item?.mediaType, 40).toLowerCase();
+    const name = this.clean(item?.mediaName, 100);
+    if (!url) return { url: "", type: "", name: "" };
+    try {
+      const parsed = new URL(url);
+      if (!/^https?:$/.test(parsed.protocol) || !parsed.pathname.startsWith("/media/uploads/")) return { url: "", type: "", name: "" };
+    } catch { return { url: "", type: "", name: "" }; }
+    if (!(type.startsWith("image/") || type.startsWith("video/"))) return { url: "", type: "", name: "" };
+    return { url, type, name };
   }
 
   cleanChannelList(value) {
