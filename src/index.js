@@ -67,7 +67,10 @@ export class ChatRoom {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", voice: "" });
+    server.serializeAttachment({
+      id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", voice: "",
+      voiceMuted: false, serverMuted: false, deafened: false
+    });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -82,7 +85,10 @@ export class ChatRoom {
     catch { this.safeSend(ws, { type: "relay_error", message: "Invalid event format." }); return; }
     if (!data || typeof data.type !== "string") return;
 
-    const attachment = ws.deserializeAttachment() || { id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", voice: "" };
+    const attachment = ws.deserializeAttachment() || {
+      id: crypto.randomUUID(), name: "", badge: "", avatar: "", avatarUrl: "", status: "", voice: "",
+      voiceMuted: false, serverMuted: false, deafened: false
+    };
     const ownId = attachment.id;
 
     if (data.type === "hello") {
@@ -98,9 +104,17 @@ export class ChatRoom {
       attachment.avatarUrl = this.clean(data.avatarUrl, 500);
       attachment.status = this.clean(data.status, 36);
       attachment.voice = "";
+      attachment.voiceMuted = false;
+      attachment.serverMuted = false;
+      attachment.deafened = false;
       ws.serializeAttachment(attachment);
+      let ownerId = await this.ctx.storage.get("ownerId");
+      if (!ownerId) {
+        ownerId = attachment.id;
+        await this.ctx.storage.put("ownerId", ownerId);
+      }
       const channels = (await this.ctx.storage.get("channels")) || [];
-      this.safeSend(ws, { type: "welcome", id: attachment.id, peers: this.peerSnapshot(ws), channels });
+      this.safeSend(ws, { type: "welcome", id: attachment.id, ownerId, peers: this.peerSnapshot(ws), channels });
       this.broadcast({ type: "presence_update", peers: this.peerSnapshot() });
       return;
     }
@@ -225,6 +239,9 @@ export class ChatRoom {
       const channel = this.clean(data.channel, 28);
       if (!channel) return;
       attachment.voice = channel;
+      attachment.voiceMuted = false;
+      attachment.serverMuted = false;
+      attachment.deafened = false;
       if (!attachment.name) return;
       attachment.badge = this.clean(data.badge, 8);
       attachment.avatar = this.clean(data.avatar, 4);
@@ -241,9 +258,83 @@ export class ChatRoom {
     if (data.type === "voice_leave") {
       const channel = attachment.voice;
       attachment.voice = "";
+      attachment.voiceMuted = false;
+      attachment.serverMuted = false;
+      attachment.deafened = false;
       ws.serializeAttachment(attachment);
       if (channel) this.broadcast({ type: "voice_peer_left", peer: { id: ownId, name: attachment.name, voice: channel } }, ws);
       this.broadcast({ type: "presence_update", peers: this.peerSnapshot() });
+      return;
+    }
+
+    if (data.type === "voice_state") {
+      if (!attachment.voice) return;
+      attachment.voiceMuted = Boolean(data.voiceMuted);
+      attachment.deafened = Boolean(data.deafened);
+      ws.serializeAttachment(attachment);
+      this.broadcast({ type: "presence_update", peers: this.peerSnapshot() });
+      return;
+    }
+
+    if (data.type === "voice_moderation") {
+      const ownerId = await this.ctx.storage.get("ownerId");
+      if (!ownerId || ownId !== ownerId) {
+        this.safeSend(ws, { type: "relay_error", message: "Only the room owner can manage voice participants." });
+        return;
+      }
+      const targetId = this.clean(data.targetId, 64);
+      const action = this.clean(data.action, 24);
+      if (!targetId || targetId === ownId) return;
+      const targetSocket = this.findSocket(targetId);
+      if (!targetSocket) return;
+      const targetInfo = targetSocket.deserializeAttachment() || {};
+      const oldChannel = this.clean(targetInfo.voice, 28);
+      if (!oldChannel) return;
+
+      if (action === "server_mute" || action === "deafen") {
+        const enabled = Boolean(data.enabled);
+        if (action === "server_mute") {
+          targetInfo.serverMuted = enabled;
+        } else {
+          targetInfo.deafened = enabled;
+        }
+        targetSocket.serializeAttachment(targetInfo);
+        this.safeSend(targetSocket, { type: "voice_moderation", action, enabled, targetId, by: ownId });
+        this.broadcast({ type: "presence_update", peers: this.peerSnapshot() });
+        return;
+      }
+
+      if (action === "disconnect") {
+        targetInfo.voice = "";
+        targetInfo.voiceMuted = false;
+        targetInfo.serverMuted = false;
+        targetInfo.deafened = false;
+        targetSocket.serializeAttachment(targetInfo);
+        this.safeSend(targetSocket, { type: "voice_moderation", action, targetId, oldChannel, by: ownId });
+        this.broadcast({ type: "voice_peer_left", peer: { id: targetInfo.id, name: targetInfo.name, voice: oldChannel } });
+        this.broadcast({ type: "presence_update", peers: this.peerSnapshot() });
+        return;
+      }
+
+      if (action === "move") {
+        const destination = this.clean(data.destination, 28);
+        if (!destination || destination.toLowerCase() === oldChannel.toLowerCase()) return;
+        const channels = (await this.ctx.storage.get("channels")) || [];
+        if (!channels.some(value => String(value).toLowerCase() === destination.toLowerCase())) {
+          this.safeSend(ws, { type: "relay_error", message: "The destination voice channel does not exist." });
+          return;
+        }
+        targetInfo.voice = destination;
+        targetSocket.serializeAttachment(targetInfo);
+        this.safeSend(targetSocket, { type: "voice_moderation", action, targetId, oldChannel, destination, by: ownId });
+        this.broadcast({ type: "voice_peer_left", peer: { id: targetInfo.id, name: targetInfo.name, voice: oldChannel } });
+        this.broadcast({ type: "voice_peer_joined", peer: {
+          id: targetInfo.id, name: targetInfo.name, voice: destination,
+          badge: targetInfo.badge || "", avatar: targetInfo.avatar || "", avatarUrl: targetInfo.avatarUrl || ""
+        } });
+        this.broadcast({ type: "presence_update", peers: this.peerSnapshot() });
+        return;
+      }
       return;
     }
 
@@ -302,7 +393,10 @@ export class ChatRoom {
           avatar: info.avatar || "",
           avatarUrl: info.avatarUrl || "",
           status: info.status || "",
-          voice: info.voice || ""
+          voice: info.voice || "",
+          voiceMuted: Boolean(info.voiceMuted),
+          serverMuted: Boolean(info.serverMuted),
+          deafened: Boolean(info.deafened)
         };
       })
       .filter(peer => peer.id);
