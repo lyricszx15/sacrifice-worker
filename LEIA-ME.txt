@@ -1,0 +1,21 @@
+SACRIFICE — SERVIDOR CORRIGIDO
+
+O problema atual é que o Worker responde /health, mas não tem o vínculo CHAT_ROOM ativo. Colar apenas src/index.js no editor do Hello World não cria o Durable Object: o arquivo wrangler.toml também precisa ser aplicado no deploy.
+
+ESTES SÃO OS ARQUIVOS COMPLETOS DO SERVIDOR. NÃO substitua os arquivos do aplicativo Android por eles.
+
+CONFIGURAÇÃO INCLUÍDA:
+- Worker: sacrifice
+- Binding: CHAT_ROOM
+- Classe: ChatRoom
+- Migração inicial SQLite: v1
+- Endpoint de teste: /health
+- Secret ROOM_KEY: deve continuar configurado no painel; não está incluído no ZIP.
+
+IMPORTANTE:
+A Cloudflare não aplica wrangler.toml quando você apenas cola JavaScript no editor Hello World. Para criar o Durable Object e aplicar a migração, publique esta pasta usando Wrangler (npx wrangler deploy) ou conecte o repositório do servidor a um fluxo de deploy que execute Wrangler.
+
+Depois de publicar, abra https://sacrifice.nnamezinha.workers.dev/health. O resultado esperado inclui:
+"status":"ok","roomKeyConfigured":true,"durableObjectConfigured":true
+
+Não compartilhe ROOM_KEY, tokens ou credenciais Cloudflare.
