@@ -9,3 +9,7 @@ class_name = "ChatRoom"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ChatRoom"]
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "sacrifice-media"
