@@ -1,11 +1,12 @@
 {
   "name": "sacrifice",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "check": "node --check src/index.js"
   },
   "devDependencies": {
     "wrangler": "^4.45.0"
