@@ -471,5 +471,3 @@ function constantTimeEquals(a, b) {
   for (let i = 0; i < length; i++) mismatch |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
   return mismatch === 0;
 }
-;
-}
