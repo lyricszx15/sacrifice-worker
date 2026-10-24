@@ -10,6 +10,3 @@ class_name = "ChatRoom"
 tag = "v1"
 new_sqlite_classes = ["ChatRoom"]
 
-[[r2_buckets]]
-binding = "MEDIA_BUCKET"
-bucket_name = "sacrifice-media"
