@@ -15,31 +15,11 @@ export default {
         roomKeyConfigured: Boolean(env.ROOM_KEY),
         durableObjectConfigured: Boolean(env.CHAT_ROOM),
         websocketEndpoint: "/ws",
-        mediaBucketConfigured: Boolean(env.MEDIA_BUCKET),
-        mediaStorage: "R2 (optional binding MEDIA_BUCKET)",
         messageHistoryStored: false
       });
     }
 
-    // Public media reads use opaque, random object keys. Uploads remain authenticated.
-    if (url.pathname.startsWith("/media/")) {
-      if (request.method !== "GET" && request.method !== "HEAD") {
-        return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, HEAD" } });
-      }
-      if (!env.MEDIA_BUCKET) return Response.json({ error: "MEDIA_BUCKET_NOT_CONFIGURED" }, { status: 503 });
-      const objectKey = url.pathname.slice("/media/".length);
-      if (!objectKey.startsWith("uploads/") || objectKey.includes("..")) return new Response("Not found", { status: 404 });
-      const object = await env.MEDIA_BUCKET.get(objectKey);
-      if (!object) return new Response("Not found", { status: 404 });
-      const headers = new Headers();
-      object.writeHttpMetadata(headers);
-      headers.set("Cache-Control", "public, max-age=31536000, immutable");
-      headers.set("X-Content-Type-Options", "nosniff");
-      if (!headers.has("Content-Type")) headers.set("Content-Type", "application/octet-stream");
-      return new Response(request.method === "HEAD" ? null : object.body, { headers });
-    }
-
-    if (url.pathname !== "/ws" && !(url.pathname === "/media" && request.method === "POST")) {
+    if (url.pathname !== "/ws") {
       return new Response("SACRIFICE relay. WebSocket endpoint: /ws", { status: 404 });
     }
 
@@ -62,29 +42,6 @@ export default {
     const matches = expectedKey && suppliedCandidates.some(value => constantTimeEquals(String(value).trim(), expectedKey));
     if (!matches) {
       return new Response("Unauthorized", { status: 401 });
-    }
-
-    if (url.pathname === "/media" && request.method === "POST") {
-      if (!env.MEDIA_BUCKET) return Response.json({ error: "MEDIA_BUCKET_NOT_CONFIGURED", message: "Crie o bucket R2 sacrifice-media e configure o binding MEDIA_BUCKET." }, { status: 503 });
-      const contentType = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
-      const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime"]);
-      if (!allowedTypes.has(contentType)) return Response.json({ error: "UNSUPPORTED_MEDIA_TYPE" }, { status: 415 });
-      const isVideo = contentType.startsWith("video/");
-      const maxBytes = isVideo ? 40 * 1024 * 1024 : 12 * 1024 * 1024;
-      const declaredSize = Number(request.headers.get("Content-Length") || 0);
-      if (declaredSize <= 0 || declaredSize > maxBytes) return Response.json({ error: "FILE_SIZE_LIMIT", maxBytes }, { status: 413 });
-      const bytes = await request.arrayBuffer();
-      if (bytes.byteLength <= 0 || bytes.byteLength > maxBytes) return Response.json({ error: "FILE_SIZE_LIMIT", maxBytes }, { status: 413 });
-      const extensions = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov" };
-      const objectKey = `uploads/${crypto.randomUUID()}.${extensions[contentType] || "bin"}`;
-      let decodedName = request.headers.get("X-Media-Name") || "arquivo";
-      try { decodedName = decodeURIComponent(decodedName); } catch { /* Keep the raw name if it is not valid URL encoding. */ }
-      const rawName = decodedName.replace(/[\r\n\0]/g, " ").trim().slice(0, 100) || "arquivo";
-      await env.MEDIA_BUCKET.put(objectKey, bytes, {
-        httpMetadata: { contentType, cacheControl: "public, max-age=31536000, immutable" },
-        customMetadata: { originalName: rawName, uploadedAt: new Date().toISOString() }
-      });
-      return Response.json({ url: `${url.origin}/media/${objectKey}`, mediaType: contentType, name: rawName, size: bytes.byteLength });
     }
 
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
@@ -491,17 +448,9 @@ export class ChatRoom {
     return ["online", "idle", "dnd"].includes(status) ? status : "online";
   }
 
-  cleanMedia(item) {
-    const url = this.clean(item?.mediaUrl, 500);
-    const type = this.clean(item?.mediaType, 40).toLowerCase();
-    const name = this.clean(item?.mediaName, 100);
-    if (!url) return { url: "", type: "", name: "" };
-    try {
-      const parsed = new URL(url);
-      if (!/^https?:$/.test(parsed.protocol) || !parsed.pathname.startsWith("/media/uploads/")) return { url: "", type: "", name: "" };
-    } catch { return { url: "", type: "", name: "" }; }
-    if (!(type.startsWith("image/") || type.startsWith("video/"))) return { url: "", type: "", name: "" };
-    return { url, type, name };
+  cleanMedia(_item) {
+    // SACRIFICE intentionally does not relay or store uploaded image/video attachments.
+    return { url: "", type: "", name: "" };
   }
 
   cleanChannelList(value) {
@@ -521,4 +470,6 @@ function constantTimeEquals(a, b) {
   const length = Math.max(a.length, b.length);
   for (let i = 0; i < length; i++) mismatch |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
   return mismatch === 0;
+}
+;
 }
